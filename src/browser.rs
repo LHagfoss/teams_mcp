@@ -2,12 +2,14 @@ use std::{
     env,
     io::{self, Write},
     path::PathBuf,
-    sync::OnceLock,
-    time::Duration,
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
-use chromiumoxide::{Browser, browser::BrowserConfig};
+use chromiumoxide::{
+    Browser, browser::BrowserConfig, cdp::browser_protocol::input::InsertTextParams, layout::Point,
+};
 use directories::ProjectDirs;
 use futures_util::StreamExt;
 use serde::Serialize;
@@ -24,8 +26,60 @@ const MAX_ITEMS: usize = 100;
 const MAX_MESSAGES: usize = 100;
 const MAX_OUTGOING_MESSAGE_CHARS: usize = 4_000;
 const MAX_SCROLL_ATTEMPTS: usize = 12;
+const FAILED_REPLY_TTL: Duration = Duration::from_secs(5 * 60);
 
 static PROFILE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+static LAST_FAILED_REPLY: OnceLock<Mutex<Option<FailedReply>>> = OnceLock::new();
+
+#[derive(Debug, Clone)]
+struct FailedReply {
+    chat_name: String,
+    message: String,
+    failed_at: Instant,
+}
+
+fn last_failed_reply() -> &'static Mutex<Option<FailedReply>> {
+    LAST_FAILED_REPLY.get_or_init(|| Mutex::new(None))
+}
+
+fn remember_failed_reply(chat_name: &str, message: &str) {
+    if let Ok(mut failed_reply) = last_failed_reply().lock() {
+        *failed_reply = Some(FailedReply {
+            chat_name: chat_name.to_string(),
+            message: message.to_string(),
+            failed_at: Instant::now(),
+        });
+    }
+}
+
+fn clear_failed_reply() {
+    if let Ok(mut failed_reply) = last_failed_reply().lock() {
+        *failed_reply = None;
+    }
+}
+
+fn reject_unapproved_standalone_fallback(
+    chat_name: &str,
+    message: &str,
+    allow_after_reply_failure: bool,
+) -> Result<()> {
+    let Ok(mut failed_reply) = last_failed_reply().lock() else {
+        return Ok(());
+    };
+    let Some(failed) = failed_reply.as_ref() else {
+        return Ok(());
+    };
+    if failed.failed_at.elapsed() > FAILED_REPLY_TTL {
+        *failed_reply = None;
+        return Ok(());
+    }
+    if !allow_after_reply_failure && failed.chat_name == chat_name && failed.message == message {
+        bail!(
+            "A reply attempt for this exact message recently failed; refusing to send it as a standalone message. Set allow_standalone_after_reply_failure=true only when the user explicitly requests a new top-level message."
+        );
+    }
+    Ok(())
+}
 
 struct BrowserSession {
     browser: Browser,
@@ -185,6 +239,19 @@ async fn page_snapshot(page: &chromiumoxide::Page) -> Result<PageSnapshot> {
 
 fn truncate(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
+}
+
+fn validate_outgoing_message(message: &str) -> Result<()> {
+    if message.trim().is_empty() {
+        bail!("message is required");
+    }
+    if message.chars().count() > MAX_OUTGOING_MESSAGE_CHARS {
+        bail!("message is limited to {MAX_OUTGOING_MESSAGE_CHARS} characters");
+    }
+    if message.contains(['\n', '\r']) {
+        bail!("message must be a single line for the initial send implementation");
+    }
+    Ok(())
 }
 
 fn looks_like_login_page(text: &str) -> bool {
@@ -696,29 +763,287 @@ pub async fn visible_messages(
     result
 }
 
+const COMPOSER_SELECTOR: &str = r#"[data-tid="ckeditor"][role="textbox"], [role="textbox"][aria-label="Type a message"], [contenteditable="true"][aria-label="Type a message"]"#;
+const SEND_SELECTOR: &str = r#"[data-tid="newMessageCommands-send"], button[aria-label^="Send"]"#;
+
+async fn send_from_composer(
+    page: &chromiumoxide::Page,
+    chat_name: &str,
+    message: &str,
+    reply_to_message_id: Option<String>,
+    reply_context_allowed: bool,
+) -> Result<SendMessageResult> {
+    let before: serde_json::Value = page
+        .evaluate(format!(
+            r#"() => {{
+                const box = document.querySelector({composer:?});
+                const send = document.querySelector({send:?});
+                return {{
+                    found: !!box,
+                    text: box?.innerText || box?.textContent || '',
+                    disabled: !send || send.disabled || send.getAttribute('aria-disabled') === 'true'
+                }};
+            }}"#,
+            composer = COMPOSER_SELECTOR,
+            send = SEND_SELECTOR,
+        ))
+        .await?
+        .into_value()?;
+    if !before
+        .get("found")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        bail!("The current Teams UI did not expose the message composer");
+    }
+    if !reply_context_allowed
+        && !before
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+    {
+        bail!("The message composer already contains a draft; refusing to overwrite it");
+    }
+
+    let composer = page
+        .find_element(COMPOSER_SELECTOR)
+        .await
+        .context("could not locate the Teams message composer")?;
+    composer.click().await?;
+
+    // type_str() calls press_key() for every character and fails for characters
+    // that are not entries in chromiumoxide's keyboard-key table. Input.insertText
+    // is the CDP operation intended for IME, emoji, and other Unicode text.
+    page.execute(InsertTextParams::new(message.to_string()))
+        .await?;
+    sleep(Duration::from_millis(150)).await;
+
+    let typed: serde_json::Value = page
+        .evaluate(format!(
+            r#"() => {{
+                const box = document.querySelector({composer:?});
+                const send = document.querySelector({send:?});
+                return {{
+                    text: box?.innerText || box?.textContent || '',
+                    disabled: !send || send.disabled || send.getAttribute('aria-disabled') === 'true'
+                }};
+            }}"#,
+            composer = COMPOSER_SELECTOR,
+            send = SEND_SELECTOR,
+        ))
+        .await?
+        .into_value()?;
+    let typed_text = typed
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let typed_text_matches = typed_text.trim() == message.trim()
+        || (reply_context_allowed && typed_text.trim_end().ends_with(message.trim()));
+    if !typed_text_matches {
+        bail!("Teams did not expose the typed message exactly; refusing to click Send");
+    }
+    if typed
+        .get("disabled")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true)
+    {
+        bail!("The Teams Send control is unavailable or disabled");
+    }
+
+    let send_button = page
+        .find_element(SEND_SELECTOR)
+        .await
+        .context("could not locate the Teams Send control")?;
+    send_button.click().await?;
+    sleep(Duration::from_millis(700)).await;
+
+    let remaining: String = page
+        .evaluate(format!(
+            r#"() => document.querySelector({composer:?})?.innerText || document.querySelector({composer:?})?.textContent || ''"#,
+            composer = COMPOSER_SELECTOR,
+        ))
+        .await?
+        .into_value()?;
+    let mut warnings = Vec::new();
+    if !remaining.trim().is_empty() {
+        warnings.push(
+            "Teams did not clear the composer after clicking Send; verify delivery in the chat."
+                .to_string(),
+        );
+    }
+    Ok(SendMessageResult {
+        chat_name: chat_name.to_string(),
+        message: message.to_string(),
+        reply_to_message_id,
+        sent: true,
+        confirmation_required: false,
+        page_url: page.url().await?.unwrap_or_default(),
+        warnings,
+    })
+}
+
+async fn ensure_composer_empty(page: &chromiumoxide::Page) -> Result<()> {
+    let state: serde_json::Value = page
+        .evaluate(format!(
+            r#"() => {{
+                const box = document.querySelector({composer:?});
+                return {{
+                    found: !!box,
+                    text: box?.innerText || box?.textContent || ''
+                }};
+            }}"#,
+            composer = COMPOSER_SELECTOR,
+        ))
+        .await?
+        .into_value()?;
+    if !state
+        .get("found")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        bail!("The current Teams UI did not expose the message composer");
+    }
+    if !state
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
+        bail!("The message composer already contains a draft; refusing to overwrite it");
+    }
+    Ok(())
+}
+
+async fn message_center(page: &chromiumoxide::Page, message_id: &str) -> Result<Option<Point>> {
+    let message_id = serde_json::to_string(message_id)?;
+    let point: serde_json::Value = page
+        .evaluate(format!(
+            r#"() => {{
+                const wanted = {message_id};
+                const marker = element => [
+                    element.getAttribute('data-message-id'),
+                    element.getAttribute('data-id'),
+                    element.id
+                ];
+                const message = Array.from(document.querySelectorAll('[data-message-id], [data-id], [id]'))
+                    .find(element => marker(element).includes(wanted));
+                if (!message) return null;
+                const container = message.closest('[data-tid="chat-pane-item"]') || message.closest('[data-tid="chat-pane-message"]') || message;
+                container.scrollIntoView({{ block: 'center', inline: 'nearest' }});
+                const rect = container.getBoundingClientRect();
+                return {{ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }};
+            }}"#,
+            message_id = message_id,
+        ))
+        .await?
+        .into_value()?;
+    let Some(x) = point.get("x").and_then(serde_json::Value::as_f64) else {
+        return Ok(None);
+    };
+    let Some(y) = point.get("y").and_then(serde_json::Value::as_f64) else {
+        return Ok(None);
+    };
+    Ok(Some(Point::new(x, y)))
+}
+
+async fn click_reply_action(page: &chromiumoxide::Page, message_id: &str) -> Result<bool> {
+    let Some(point) = message_center(page, message_id).await? else {
+        return Ok(false);
+    };
+    page.move_mouse(point).await?;
+    sleep(Duration::from_millis(350)).await;
+
+    let message_id = serde_json::to_string(message_id)?;
+    let action: String = page
+        .evaluate(format!(
+            r#"() => {{
+                const wanted = {message_id};
+                const marker = element => [
+                    element.getAttribute('data-message-id'),
+                    element.getAttribute('data-id'),
+                    element.id
+                ];
+                const message = Array.from(document.querySelectorAll('[data-message-id], [data-id], [id]'))
+                    .find(element => marker(element).includes(wanted));
+                if (!message) return 'none';
+                const container = message.closest('[data-tid="chat-pane-item"]') || message.closest('[data-tid="chat-pane-message"]') || message;
+                const visible = element => {{
+                    const rect = element.getBoundingClientRect();
+                    const style = getComputedStyle(element);
+                    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+                }};
+                const label = element => [
+                    element.getAttribute('aria-label'),
+                    element.getAttribute('title'),
+                    element.getAttribute('data-tid'),
+                    element.matches('button, [role="button"], [role="menuitem"]') ? element.innerText : ''
+                ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+                const controls = root => Array.from(root.querySelectorAll('button, [role="button"], [role="menuitem"], [aria-label], [title], [data-tid]'))
+                    .filter(visible);
+                const reply = controls(container).find(element => /\breply\b/i.test(label(element)));
+                if (reply) {{ reply.click(); return 'reply'; }}
+                const more = controls(container).find(element => /\b(more|options|actions)\b/i.test(label(element)));
+                if (more) {{ more.click(); return 'more'; }}
+                return 'none';
+            }}"#,
+            message_id = message_id,
+        ))
+        .await?
+        .into_value()?;
+    if action == "reply" {
+        return Ok(true);
+    }
+    if action != "more" {
+        return Ok(false);
+    }
+
+    sleep(Duration::from_millis(250)).await;
+    let clicked: bool = page
+        .evaluate(
+            r#"() => {
+                const visible = element => {
+                    const rect = element.getBoundingClientRect();
+                    const style = getComputedStyle(element);
+                    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+                };
+                const label = element => [
+                    element.getAttribute('aria-label'),
+                    element.getAttribute('title'),
+                    element.matches('button, [role="button"], [role="menuitem"]') ? element.innerText : ''
+                ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+                const reply = Array.from(document.querySelectorAll('[role="menuitem"], button, [role="button"], [aria-label], [title]'))
+                    .filter(visible)
+                    .find(element => /^reply(?: to message)?$/i.test(label(element)) || /\breply\b/i.test(label(element)));
+                if (!reply) return false;
+                reply.click();
+                return true;
+            }"#,
+        )
+        .await?
+        .into_value()?;
+    Ok(clicked)
+}
+
 pub async fn send_chat_message(
     chat_name: &str,
     message: &str,
     confirm: bool,
+    allow_after_reply_failure: bool,
 ) -> Result<SendMessageResult> {
     let chat_name = chat_name.trim();
     if chat_name.is_empty() {
         bail!("chat_name is required");
     }
-    if message.trim().is_empty() {
-        bail!("message is required");
-    }
-    if message.chars().count() > MAX_OUTGOING_MESSAGE_CHARS {
-        bail!("message is limited to {MAX_OUTGOING_MESSAGE_CHARS} characters");
-    }
-    if message.contains('\n') || message.contains('\r') {
-        bail!("message must be a single line for the initial send implementation");
-    }
+    validate_outgoing_message(message)?;
 
     if !confirm {
         return Ok(SendMessageResult {
             chat_name: chat_name.to_string(),
             message: message.to_string(),
+            reply_to_message_id: None,
             sent: false,
             confirmation_required: true,
             page_url: teams_url(),
@@ -728,6 +1053,8 @@ pub async fn send_chat_message(
             ],
         });
     }
+
+    reject_unapproved_standalone_fallback(chat_name, message, allow_after_reply_failure)?;
 
     let session = prepared_page().await?;
     let result = async {
@@ -743,115 +1070,79 @@ pub async fn send_chat_message(
         }
         sleep(Duration::from_millis(600)).await;
 
-        let before: serde_json::Value = session
-            .page
-            .evaluate(
-                r#"() => {
-                    const box = document.querySelector('[data-tid="ckeditor"][role="textbox"], [role="textbox"][aria-label="Type a message"], [contenteditable="true"][aria-label="Type a message"]');
-                    const send = document.querySelector('[data-tid="newMessageCommands-send"], button[aria-label^="Send"]');
-                    return {
-                        found: !!box,
-                        text: box?.innerText || box?.textContent || '',
-                        disabled: !send || send.disabled || send.getAttribute('aria-disabled') === 'true'
-                    };
-                }"#,
-            )
-            .await?
-            .into_value()?;
-        if !before
-            .get("found")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        {
-            bail!("The current Teams UI did not expose the message composer");
-        }
-        if !before
-            .get("text")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .trim()
-            .is_empty()
-        {
-            bail!("The message composer already contains a draft; refusing to overwrite it");
-        }
-
-        let composer = session
-            .page
-            .find_element(
-                r#"[data-tid="ckeditor"][role="textbox"], [role="textbox"][aria-label="Type a message"], [contenteditable="true"][aria-label="Type a message"]"#,
-            )
-            .await
-            .context("could not locate the Teams message composer")?;
-        composer.click().await?.type_str(message).await?;
-        sleep(Duration::from_millis(150)).await;
-
-        let typed: serde_json::Value = session
-            .page
-            .evaluate(
-                r#"() => {
-                    const box = document.querySelector('[data-tid="ckeditor"][role="textbox"], [role="textbox"][aria-label="Type a message"], [contenteditable="true"][aria-label="Type a message"]');
-                    const send = document.querySelector('[data-tid="newMessageCommands-send"], button[aria-label^="Send"]');
-                    return {
-                        text: box?.innerText || box?.textContent || '',
-                        disabled: !send || send.disabled || send.getAttribute('aria-disabled') === 'true'
-                    };
-                }"#,
-            )
-            .await?
-            .into_value()?;
-        let typed_text = typed
-            .get("text")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        if typed_text.trim() != message.trim() {
-            bail!("Teams did not expose the typed message exactly; refusing to click Send");
-        }
-        if typed
-            .get("disabled")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(true)
-        {
-            bail!("The Teams Send control is unavailable or disabled");
-        }
-
-        let send_button = session
-            .page
-            .find_element(
-                r#"[data-tid="newMessageCommands-send"], button[aria-label^="Send"]"#,
-            )
-            .await
-            .context("could not locate the Teams Send control")?;
-        send_button.click().await?;
-        sleep(Duration::from_millis(700)).await;
-
-        let remaining: String = session
-            .page
-            .evaluate(
-                r#"() => {
-                    const box = document.querySelector('[data-tid="ckeditor"][role="textbox"], [role="textbox"][aria-label="Type a message"], [contenteditable="true"][aria-label="Type a message"]');
-                    return box?.innerText || box?.textContent || '';
-                }"#,
-            )
-            .await?
-            .into_value()?;
-        let mut warnings = Vec::new();
-        if !remaining.trim().is_empty() {
-            warnings.push(
-                "Teams did not clear the composer after clicking Send; verify delivery in the chat."
-                    .to_string(),
-            );
-        }
-        Ok(SendMessageResult {
-            chat_name: chat_name.to_string(),
-            message: message.to_string(),
-            sent: true,
-            confirmation_required: false,
-            page_url: session.page.url().await?.unwrap_or_default(),
-            warnings,
-        })
+        send_from_composer(&session.page, chat_name, message, None, false).await
     }
     .await;
     finish(session).await?;
+    if result.is_ok() {
+        clear_failed_reply();
+    }
+    result
+}
+
+pub async fn reply_to_chat_message(
+    chat_name: &str,
+    message_id: &str,
+    message: &str,
+    confirm: bool,
+) -> Result<SendMessageResult> {
+    let chat_name = chat_name.trim();
+    let message_id = message_id.trim();
+    if chat_name.is_empty() {
+        bail!("chat_name is required");
+    }
+    if message_id.is_empty() {
+        bail!("message_id is required");
+    }
+    validate_outgoing_message(message)?;
+
+    if !confirm {
+        return Ok(SendMessageResult {
+            chat_name: chat_name.to_string(),
+            message: message.to_string(),
+            reply_to_message_id: Some(message_id.to_string()),
+            sent: false,
+            confirmation_required: true,
+            page_url: teams_url(),
+            warnings: vec![
+                "Preview only: pass confirm=true to open the chat and send this reply.".to_string(),
+            ],
+        });
+    }
+
+    let session = prepared_page().await?;
+    let result = async {
+        let navigation_clicked = click_navigation(&session.page, &["Chat", "Chats"]).await?;
+        if navigation_clicked {
+            sleep(Duration::from_millis(400)).await;
+        } else {
+            bail!("Could not find the Chat navigation control");
+        }
+        if !click_visible_label(&session.page, chat_name).await? {
+            bail!("Could not find an exact visible chat label {chat_name:?}; refusing to reply");
+        }
+        sleep(Duration::from_millis(600)).await;
+        ensure_composer_empty(&session.page).await?;
+        if !click_reply_action(&session.page, message_id).await? {
+            bail!("Could not find a Reply action for visible Teams message {message_id:?}; refusing to send");
+        }
+        sleep(Duration::from_millis(300)).await;
+        send_from_composer(
+            &session.page,
+            chat_name,
+            message,
+            Some(message_id.to_string()),
+            true,
+        )
+        .await
+    }
+    .await;
+    finish(session).await?;
+    if result.is_err() {
+        remember_failed_reply(chat_name, message);
+    } else {
+        clear_failed_reply();
+    }
     result
 }
 
@@ -977,4 +1268,19 @@ pub fn logout() -> Result<()> {
         println!("Kept the local Teams browser profile.");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_outgoing_message;
+
+    #[test]
+    fn outgoing_messages_accept_unicode_text() {
+        assert!(validate_outgoing_message("når, så, på, å, buffé, også, gå 😀").is_ok());
+    }
+
+    #[test]
+    fn outgoing_messages_still_reject_multiline_text() {
+        assert!(validate_outgoing_message("first line\nsecond line").is_err());
+    }
 }
