@@ -70,7 +70,8 @@ impl TeamsServer {
     /// Return a bounded snapshot of the authenticated Teams page.
     #[tool(
         name = "get_teams_overview",
-        description = "Read the current visible Microsoft Teams page. Read-only; visible text is bounded and no credentials are returned."
+        description = "Read the current visible Microsoft Teams page. Read-only; visible text is bounded and no credentials are returned.",
+        annotations(read_only_hint = true)
     )]
     async fn get_teams_overview(&self) -> CallToolResult {
         match browser::visible_snapshot().await {
@@ -82,7 +83,8 @@ impl TeamsServer {
     /// List team labels currently exposed in the visible Teams navigation.
     #[tool(
         name = "list_teams",
-        description = "List visible Microsoft Teams labels from the current navigation. Results are UI labels, not Graph IDs. Read-only."
+        description = "List visible Microsoft Teams labels from the current navigation. Results are UI labels, not Graph IDs. Read-only.",
+        annotations(read_only_hint = true)
     )]
     async fn list_teams(&self) -> CallToolResult {
         match browser::list_teams().await {
@@ -94,7 +96,8 @@ impl TeamsServer {
     /// List channel labels under a visible team.
     #[tool(
         name = "list_channels",
-        description = "List visible channel labels, optionally after selecting an exact visible team label. Read-only; UI labels are not Graph IDs."
+        description = "List visible channel labels, optionally after selecting an exact visible team label. Read-only; UI labels are not Graph IDs.",
+        annotations(read_only_hint = true)
     )]
     async fn list_channels(
         &self,
@@ -109,7 +112,8 @@ impl TeamsServer {
     /// List chat labels currently rendered in the visible Teams navigation.
     #[tool(
         name = "list_chats",
-        description = "List visible Microsoft Teams chat labels. Read-only; labels are UI references, not Graph IDs."
+        description = "List visible Microsoft Teams chat labels. Read-only; labels are UI references, not Graph IDs.",
+        annotations(read_only_hint = true)
     )]
     async fn list_chats(&self) -> CallToolResult {
         match browser::list_chats().await {
@@ -121,7 +125,8 @@ impl TeamsServer {
     /// List visible members associated with a selected chat.
     #[tool(
         name = "list_chat_members",
-        description = "Click an exact visible chat label and read member or participant metadata exposed by the current Teams UI. Read-only."
+        description = "Click an exact visible chat label and read member or participant metadata exposed by the current Teams UI. Read-only.",
+        annotations(read_only_hint = true)
     )]
     async fn list_chat_members(
         &self,
@@ -136,7 +141,8 @@ impl TeamsServer {
     /// Read paginated messages after selecting a visible chat.
     #[tool(
         name = "get_chat_messages",
-        description = "Read visible Teams chat messages with page-based pagination. Page 1 is newest; larger pages scroll toward older messages. This uses the visible UI only."
+        description = "Read visible Teams chat messages with page-based pagination. Page 1 is newest; larger pages scroll toward older messages. This uses the visible UI only.",
+        annotations(read_only_hint = true)
     )]
     async fn get_chat_messages(
         &self,
@@ -153,7 +159,8 @@ impl TeamsServer {
     /// Return the low-level normalized page shape used by the adapter.
     #[tool(
         name = "inspect_teams_page",
-        description = "Read bounded visible Teams page text for adapter diagnostics. Read-only."
+        description = "Read bounded visible Teams page text for adapter diagnostics. Read-only.",
+        annotations(read_only_hint = true)
     )]
     async fn inspect_teams_page(&self) -> CallToolResult {
         match browser::visible_snapshot().await {
@@ -168,6 +175,29 @@ impl TeamsServer {
 
 #[tool_handler]
 impl rmcp::ServerHandler for TeamsServer {}
+
+#[cfg(test)]
+mod tests {
+    use super::TeamsServer;
+
+    /// Every tool is a read-only UI inspection: selecting a chat only moves
+    /// ephemeral UI focus and never persists external state. The annotation
+    /// is what lets MCP clients (e.g. rustcode) batch these calls instead of
+    /// serializing them one per model round.
+    #[test]
+    fn all_tools_advertise_read_only_hint() {
+        let tools = TeamsServer::tool_router().list_all();
+        assert_eq!(tools.len(), 7, "expected 7 teams tools, got {}", tools.len());
+        for tool in &tools {
+            assert_eq!(
+                tool.annotations.as_ref().and_then(|a| a.read_only_hint),
+                Some(true),
+                "tool {} must set read_only_hint",
+                tool.name
+            );
+        }
+    }
+}
 
 pub async fn serve() -> Result<()> {
     let server = TeamsServer::default();
