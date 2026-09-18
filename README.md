@@ -1,6 +1,6 @@
 # Teams MCP
 
-A local, read-only Microsoft Teams MCP server written in Rust.
+A local Microsoft Teams MCP server written in Rust. Reads use the visible Teams UI; sending messages is explicitly confirmation-gated.
 
 It uses a dedicated persistent Chrome profile for Microsoft authentication. The application never reads passwords, MFA codes, cookies, or Microsoft Graph tokens. You log in through the normal browser UI, and later MCP calls reuse that browser session to inspect the visible Teams application.
 
@@ -28,6 +28,7 @@ HTTP has no built-in authentication and should remain bound to loopback unless a
 - `list_chats` — visible chat labels.
 - `list_chat_members` — visible users/participants for an exact visible chat label.
 - `get_chat_messages` — paginated visible messages for an exact visible chat label. Page 1 is newest; higher pages scroll toward older messages. The default is 10 messages per page.
+- `send_chat_message` — preview or confirmation-gated send of a single-line message to an exact visible chat. It never sends unless `confirm: true` is passed.
 - `inspect_teams_page` — bounded adapter diagnostics.
 
 The first version intentionally uses the visible Teams UI rather than undocumented network calls or Microsoft Graph credentials. Team, channel, and chat names are UI references, not invented backend IDs. Message results include visible text plus author, author ID, timestamp, message ID, and edited metadata when the page exposes them. Teams is a large SPA and its DOM can change; `inspect_teams_page` and the warnings in results make that behavior observable.
@@ -56,4 +57,4 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo build
 ```
 
-All current operations are read-only. Writes, sending messages, file downloads, and Microsoft Graph integration are deliberately not included.
+Sending is the only write operation currently supported. The tool refuses empty, multiline, overlong, ambiguous, or already-drafted sends and uses the visible Teams composer and Send control. File downloads, edits/deletes, and Microsoft Graph integration are deliberately not included.

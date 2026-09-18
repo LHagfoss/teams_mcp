@@ -58,3 +58,14 @@ pub struct MessagesResult {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct SendMessageResult {
+    pub chat_name: String,
+    pub message: String,
+    pub sent: bool,
+    pub confirmation_required: bool,
+    pub page_url: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}

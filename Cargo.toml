@@ -3,7 +3,7 @@ name = "teams-mcp"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Local read-only Microsoft Teams MCP server using a persistent browser profile"
+description = "Local Microsoft Teams MCP server using a persistent browser profile"
 license = "MIT"
 
 [[bin]]

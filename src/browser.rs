@@ -13,13 +13,16 @@ use futures_util::StreamExt;
 use serde::Serialize;
 use tokio::time::{sleep, timeout};
 
-use crate::data::{ItemsResult, MessagesResult, PageSnapshot, UiItem, VisibleMessage};
+use crate::data::{
+    ItemsResult, MessagesResult, PageSnapshot, SendMessageResult, UiItem, VisibleMessage,
+};
 
 const DEFAULT_TEAMS_URL: &str = "https://teams.live.com/v2/";
 const LOGIN_WAIT: Duration = Duration::from_secs(10 * 60);
 const MAX_VISIBLE_TEXT_CHARS: usize = 20_000;
 const MAX_ITEMS: usize = 100;
 const MAX_MESSAGES: usize = 100;
+const MAX_OUTGOING_MESSAGE_CHARS: usize = 4_000;
 const MAX_SCROLL_ATTEMPTS: usize = 12;
 
 static PROFILE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
@@ -685,6 +688,165 @@ pub async fn visible_messages(
             page_size: page_size as u32,
             has_more,
             messages,
+            warnings,
+        })
+    }
+    .await;
+    finish(session).await?;
+    result
+}
+
+pub async fn send_chat_message(
+    chat_name: &str,
+    message: &str,
+    confirm: bool,
+) -> Result<SendMessageResult> {
+    let chat_name = chat_name.trim();
+    if chat_name.is_empty() {
+        bail!("chat_name is required");
+    }
+    if message.trim().is_empty() {
+        bail!("message is required");
+    }
+    if message.chars().count() > MAX_OUTGOING_MESSAGE_CHARS {
+        bail!("message is limited to {MAX_OUTGOING_MESSAGE_CHARS} characters");
+    }
+    if message.contains('\n') || message.contains('\r') {
+        bail!("message must be a single line for the initial send implementation");
+    }
+
+    if !confirm {
+        return Ok(SendMessageResult {
+            chat_name: chat_name.to_string(),
+            message: message.to_string(),
+            sent: false,
+            confirmation_required: true,
+            page_url: teams_url(),
+            warnings: vec![
+                "Preview only: pass confirm=true to open the chat and send this message."
+                    .to_string(),
+            ],
+        });
+    }
+
+    let session = prepared_page().await?;
+    let result = async {
+        let navigation_clicked = click_navigation(&session.page, &["Chat", "Chats"]).await?;
+        if navigation_clicked {
+            sleep(Duration::from_millis(400)).await;
+        } else {
+            bail!("Could not find the Chat navigation control");
+        }
+
+        if !click_visible_label(&session.page, chat_name).await? {
+            bail!("Could not find an exact visible chat label {chat_name:?}; refusing to send");
+        }
+        sleep(Duration::from_millis(600)).await;
+
+        let before: serde_json::Value = session
+            .page
+            .evaluate(
+                r#"() => {
+                    const box = document.querySelector('[data-tid="ckeditor"][role="textbox"], [role="textbox"][aria-label="Type a message"], [contenteditable="true"][aria-label="Type a message"]');
+                    const send = document.querySelector('[data-tid="newMessageCommands-send"], button[aria-label^="Send"]');
+                    return {
+                        found: !!box,
+                        text: box?.innerText || box?.textContent || '',
+                        disabled: !send || send.disabled || send.getAttribute('aria-disabled') === 'true'
+                    };
+                }"#,
+            )
+            .await?
+            .into_value()?;
+        if !before
+            .get("found")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            bail!("The current Teams UI did not expose the message composer");
+        }
+        if !before
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        {
+            bail!("The message composer already contains a draft; refusing to overwrite it");
+        }
+
+        let composer = session
+            .page
+            .find_element(
+                r#"[data-tid="ckeditor"][role="textbox"], [role="textbox"][aria-label="Type a message"], [contenteditable="true"][aria-label="Type a message"]"#,
+            )
+            .await
+            .context("could not locate the Teams message composer")?;
+        composer.click().await?.type_str(message).await?;
+        sleep(Duration::from_millis(150)).await;
+
+        let typed: serde_json::Value = session
+            .page
+            .evaluate(
+                r#"() => {
+                    const box = document.querySelector('[data-tid="ckeditor"][role="textbox"], [role="textbox"][aria-label="Type a message"], [contenteditable="true"][aria-label="Type a message"]');
+                    const send = document.querySelector('[data-tid="newMessageCommands-send"], button[aria-label^="Send"]');
+                    return {
+                        text: box?.innerText || box?.textContent || '',
+                        disabled: !send || send.disabled || send.getAttribute('aria-disabled') === 'true'
+                    };
+                }"#,
+            )
+            .await?
+            .into_value()?;
+        let typed_text = typed
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if typed_text.trim() != message.trim() {
+            bail!("Teams did not expose the typed message exactly; refusing to click Send");
+        }
+        if typed
+            .get("disabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true)
+        {
+            bail!("The Teams Send control is unavailable or disabled");
+        }
+
+        let send_button = session
+            .page
+            .find_element(
+                r#"[data-tid="newMessageCommands-send"], button[aria-label^="Send"]"#,
+            )
+            .await
+            .context("could not locate the Teams Send control")?;
+        send_button.click().await?;
+        sleep(Duration::from_millis(700)).await;
+
+        let remaining: String = session
+            .page
+            .evaluate(
+                r#"() => {
+                    const box = document.querySelector('[data-tid="ckeditor"][role="textbox"], [role="textbox"][aria-label="Type a message"], [contenteditable="true"][aria-label="Type a message"]');
+                    return box?.innerText || box?.textContent || '';
+                }"#,
+            )
+            .await?
+            .into_value()?;
+        let mut warnings = Vec::new();
+        if !remaining.trim().is_empty() {
+            warnings.push(
+                "Teams did not clear the composer after clicking Send; verify delivery in the chat."
+                    .to_string(),
+            );
+        }
+        Ok(SendMessageResult {
+            chat_name: chat_name.to_string(),
+            message: message.to_string(),
+            sent: true,
+            confirmation_required: false,
+            page_url: session.page.url().await?.unwrap_or_default(),
             warnings,
         })
     }

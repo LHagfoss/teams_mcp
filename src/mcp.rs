@@ -54,6 +54,17 @@ pub struct ChatMembersRequest {
     pub chat_name: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SendChatMessageRequest {
+    /// Exact visible chat label.
+    pub chat_name: String,
+    /// A single-line message to send.
+    pub message: String,
+    /// Required to perform the external send. Omit or set false for a preview.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
 fn json_success<T: Serialize>(value: &T) -> CallToolResult {
     match serde_json::to_string_pretty(value) {
         Ok(text) => CallToolResult::success(vec![rmcp::model::ContentBlock::text(text)]),
@@ -156,6 +167,28 @@ impl TeamsServer {
         }
     }
 
+    /// Preview or send a message to a visible chat.
+    #[tool(
+        name = "send_chat_message",
+        description = "Preview or send one single-line message to an exact visible Microsoft Teams chat. This is a write operation: confirm must be true to send; otherwise no browser is opened and only a preview is returned.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    async fn send_chat_message(
+        &self,
+        Parameters(request): Parameters<SendChatMessageRequest>,
+    ) -> CallToolResult {
+        match browser::send_chat_message(&request.chat_name, &request.message, request.confirm)
+            .await
+        {
+            Ok(value) => json_success(&value),
+            Err(error) => json_error(format!("Could not send Teams chat message: {error:#}")),
+        }
+    }
+
     /// Return the low-level normalized page shape used by the adapter.
     #[tool(
         name = "inspect_teams_page",
@@ -176,32 +209,39 @@ impl TeamsServer {
 #[tool_handler]
 impl rmcp::ServerHandler for TeamsServer {}
 
-#[cfg(test)]
-mod tests {
-    use super::TeamsServer;
-
-    /// Every tool is a read-only UI inspection: selecting a chat only moves
-    /// ephemeral UI focus and never persists external state. The annotation
-    /// is what lets MCP clients (e.g. rustcode) batch these calls instead of
-    /// serializing them one per model round.
-    #[test]
-    fn all_tools_advertise_read_only_hint() {
-        let tools = TeamsServer::tool_router().list_all();
-        assert_eq!(tools.len(), 7, "expected 7 teams tools, got {}", tools.len());
-        for tool in &tools {
-            assert_eq!(
-                tool.annotations.as_ref().and_then(|a| a.read_only_hint),
-                Some(true),
-                "tool {} must set read_only_hint",
-                tool.name
-            );
-        }
-    }
-}
-
 pub async fn serve() -> Result<()> {
     let server = TeamsServer::default();
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TeamsServer;
+
+    /// Read tools advertise their read-only hint so MCP clients can batch them.
+    #[test]
+    fn all_tools_advertise_read_only_hint() {
+        let tools = TeamsServer::tool_router().list_all();
+        assert_eq!(
+            tools.len(),
+            8,
+            "expected 8 teams tools, got {}",
+            tools.len()
+        );
+        for tool in &tools {
+            let read_only = tool.annotations.as_ref().and_then(|a| a.read_only_hint);
+            if tool.name == "send_chat_message" {
+                assert_eq!(read_only, Some(false));
+            } else {
+                assert_eq!(
+                    read_only,
+                    Some(true),
+                    "tool {} must set read_only_hint",
+                    tool.name
+                );
+            }
+        }
+    }
 }
