@@ -54,6 +54,17 @@ pub struct ChatMembersRequest {
     pub chat_name: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SendChatMessageRequest {
+    /// Exact visible chat label.
+    pub chat_name: String,
+    /// A single-line message to send.
+    pub message: String,
+    /// Required to perform the external send. Omit or set false for a preview.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
 fn json_success<T: Serialize>(value: &T) -> CallToolResult {
     match serde_json::to_string_pretty(value) {
         Ok(text) => CallToolResult::success(vec![rmcp::model::ContentBlock::text(text)]),
@@ -70,7 +81,8 @@ impl TeamsServer {
     /// Return a bounded snapshot of the authenticated Teams page.
     #[tool(
         name = "get_teams_overview",
-        description = "Read the current visible Microsoft Teams page. Read-only; visible text is bounded and no credentials are returned."
+        description = "Read the current visible Microsoft Teams page. Read-only; visible text is bounded and no credentials are returned.",
+        annotations(read_only_hint = true)
     )]
     async fn get_teams_overview(&self) -> CallToolResult {
         match browser::visible_snapshot().await {
@@ -82,7 +94,8 @@ impl TeamsServer {
     /// List team labels currently exposed in the visible Teams navigation.
     #[tool(
         name = "list_teams",
-        description = "List visible Microsoft Teams labels from the current navigation. Results are UI labels, not Graph IDs. Read-only."
+        description = "List visible Microsoft Teams labels from the current navigation. Results are UI labels, not Graph IDs. Read-only.",
+        annotations(read_only_hint = true)
     )]
     async fn list_teams(&self) -> CallToolResult {
         match browser::list_teams().await {
@@ -94,7 +107,8 @@ impl TeamsServer {
     /// List channel labels under a visible team.
     #[tool(
         name = "list_channels",
-        description = "List visible channel labels, optionally after selecting an exact visible team label. Read-only; UI labels are not Graph IDs."
+        description = "List visible channel labels, optionally after selecting an exact visible team label. Read-only; UI labels are not Graph IDs.",
+        annotations(read_only_hint = true)
     )]
     async fn list_channels(
         &self,
@@ -109,7 +123,8 @@ impl TeamsServer {
     /// List chat labels currently rendered in the visible Teams navigation.
     #[tool(
         name = "list_chats",
-        description = "List visible Microsoft Teams chat labels. Read-only; labels are UI references, not Graph IDs."
+        description = "List visible Microsoft Teams chat labels. Read-only; labels are UI references, not Graph IDs.",
+        annotations(read_only_hint = true)
     )]
     async fn list_chats(&self) -> CallToolResult {
         match browser::list_chats().await {
@@ -121,7 +136,8 @@ impl TeamsServer {
     /// List visible members associated with a selected chat.
     #[tool(
         name = "list_chat_members",
-        description = "Click an exact visible chat label and read member or participant metadata exposed by the current Teams UI. Read-only."
+        description = "Click an exact visible chat label and read member or participant metadata exposed by the current Teams UI. Read-only.",
+        annotations(read_only_hint = true)
     )]
     async fn list_chat_members(
         &self,
@@ -136,7 +152,8 @@ impl TeamsServer {
     /// Read paginated messages after selecting a visible chat.
     #[tool(
         name = "get_chat_messages",
-        description = "Read visible Teams chat messages with page-based pagination. Page 1 is newest; larger pages scroll toward older messages. This uses the visible UI only."
+        description = "Read visible Teams chat messages with page-based pagination. Page 1 is newest; larger pages scroll toward older messages. This uses the visible UI only.",
+        annotations(read_only_hint = true)
     )]
     async fn get_chat_messages(
         &self,
@@ -150,10 +167,33 @@ impl TeamsServer {
         }
     }
 
+    /// Preview or send a message to a visible chat.
+    #[tool(
+        name = "send_chat_message",
+        description = "Preview or send one single-line message to an exact visible Microsoft Teams chat. This is a write operation: confirm must be true to send; otherwise no browser is opened and only a preview is returned.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    async fn send_chat_message(
+        &self,
+        Parameters(request): Parameters<SendChatMessageRequest>,
+    ) -> CallToolResult {
+        match browser::send_chat_message(&request.chat_name, &request.message, request.confirm)
+            .await
+        {
+            Ok(value) => json_success(&value),
+            Err(error) => json_error(format!("Could not send Teams chat message: {error:#}")),
+        }
+    }
+
     /// Return the low-level normalized page shape used by the adapter.
     #[tool(
         name = "inspect_teams_page",
-        description = "Read bounded visible Teams page text for adapter diagnostics. Read-only."
+        description = "Read bounded visible Teams page text for adapter diagnostics. Read-only.",
+        annotations(read_only_hint = true)
     )]
     async fn inspect_teams_page(&self) -> CallToolResult {
         match browser::visible_snapshot().await {
@@ -174,4 +214,34 @@ pub async fn serve() -> Result<()> {
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TeamsServer;
+
+    /// Read tools advertise their read-only hint so MCP clients can batch them.
+    #[test]
+    fn all_tools_advertise_read_only_hint() {
+        let tools = TeamsServer::tool_router().list_all();
+        assert_eq!(
+            tools.len(),
+            8,
+            "expected 8 teams tools, got {}",
+            tools.len()
+        );
+        for tool in &tools {
+            let read_only = tool.annotations.as_ref().and_then(|a| a.read_only_hint);
+            if tool.name == "send_chat_message" {
+                assert_eq!(read_only, Some(false));
+            } else {
+                assert_eq!(
+                    read_only,
+                    Some(true),
+                    "tool {} must set read_only_hint",
+                    tool.name
+                );
+            }
+        }
+    }
 }
