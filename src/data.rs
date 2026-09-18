@@ -63,6 +63,8 @@ pub struct MessagesResult {
 pub struct SendMessageResult {
     pub chat_name: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_message_id: Option<String>,
     pub sent: bool,
     pub confirmation_required: bool,
     pub page_url: String,

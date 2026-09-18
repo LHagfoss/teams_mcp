@@ -63,6 +63,22 @@ pub struct SendChatMessageRequest {
     /// Required to perform the external send. Omit or set false for a preview.
     #[serde(default)]
     pub confirm: bool,
+    /// Set true only when the user explicitly wants a new top-level message after a reply attempt failed.
+    #[serde(default)]
+    pub allow_standalone_after_reply_failure: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ReplyToChatMessageRequest {
+    /// Exact visible chat label.
+    pub chat_name: String,
+    /// The message_id returned by get_chat_messages.
+    pub message_id: String,
+    /// A single-line message to send as a reply.
+    pub message: String,
+    /// Required to perform the external send. Omit or set false for a preview.
+    #[serde(default)]
+    pub confirm: bool,
 }
 
 fn json_success<T: Serialize>(value: &T) -> CallToolResult {
@@ -170,7 +186,7 @@ impl TeamsServer {
     /// Preview or send a message to a visible chat.
     #[tool(
         name = "send_chat_message",
-        description = "Preview or send one single-line message to an exact visible Microsoft Teams chat. This is a write operation: confirm must be true to send; otherwise no browser is opened and only a preview is returned.",
+        description = "Preview or send one single-line top-level message to an exact visible Microsoft Teams chat. This is not a reply operation. Never use it as a fallback when reply_to_chat_message fails; the same-text fallback is blocked unless allow_standalone_after_reply_failure=true, which is permitted only when the user explicitly asks for a new top-level message. confirm must be true to send; otherwise no browser is opened and only a preview is returned.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -181,11 +197,45 @@ impl TeamsServer {
         &self,
         Parameters(request): Parameters<SendChatMessageRequest>,
     ) -> CallToolResult {
-        match browser::send_chat_message(&request.chat_name, &request.message, request.confirm)
-            .await
+        match browser::send_chat_message(
+            &request.chat_name,
+            &request.message,
+            request.confirm,
+            request.allow_standalone_after_reply_failure,
+        )
+        .await
         {
             Ok(value) => json_success(&value),
             Err(error) => json_error(format!("Could not send Teams chat message: {error:#}")),
+        }
+    }
+
+    /// Preview or reply to a visible message in a chat.
+    #[tool(
+        name = "reply_to_chat_message",
+        description = "Preview or send one single-line Unicode message as a threaded reply to an exact visible Microsoft Teams chat message. Use message_id from get_chat_messages. If this tool fails, the reply was not sent; do not call send_chat_message as a fallback unless the user explicitly changes the request to a new top-level message. This is a write operation: confirm must be true to send; otherwise no browser is opened and only a preview is returned.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    async fn reply_to_chat_message(
+        &self,
+        Parameters(request): Parameters<ReplyToChatMessageRequest>,
+    ) -> CallToolResult {
+        match browser::reply_to_chat_message(
+            &request.chat_name,
+            &request.message_id,
+            &request.message,
+            request.confirm,
+        )
+        .await
+        {
+            Ok(value) => json_success(&value),
+            Err(error) => json_error(format!(
+                "REPLY_NOT_SENT: Could not reply to Teams chat message: {error:#}. Do not send the same text as a standalone message unless the user explicitly requests that change."
+            )),
         }
     }
 
@@ -226,13 +276,16 @@ mod tests {
         let tools = TeamsServer::tool_router().list_all();
         assert_eq!(
             tools.len(),
-            8,
-            "expected 8 teams tools, got {}",
+            9,
+            "expected 9 teams tools, got {}",
             tools.len()
         );
         for tool in &tools {
             let read_only = tool.annotations.as_ref().and_then(|a| a.read_only_hint);
-            if tool.name == "send_chat_message" {
+            if matches!(
+                tool.name.as_ref(),
+                "send_chat_message" | "reply_to_chat_message"
+            ) {
                 assert_eq!(read_only, Some(false));
             } else {
                 assert_eq!(
