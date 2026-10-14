@@ -24,11 +24,17 @@ Microsoft Teams via the user's logged-in web UI (persistent local browser profil
 Names are exact visible UI labels, not Graph IDs: call list_chats / list_teams / list_channels first and \
 reuse labels verbatim. List tools page with page/page_size (default 50); check has_more.\n\
 Reading: get_chat_messages page 1 is newest; higher pages are older.\n\
-Writing (send_chat_message, reply_to_chat_message) sends real messages as the user:\n\
+Writing (send_chat_message, reply_to_chat_message) sends real messages as the user; clear_chat_draft \
+only clears the composer and never sends:\n\
 - Call without confirm first to get a preview (no browser opened); set confirm=true only when the user \
 clearly asked to send that exact text to that chat.\n\
 - Messages are single-line.\n\
-- To answer a specific message use reply_to_chat_message with message_id from get_chat_messages.\n\
+- @person tokens are resolved through the visible participant list and the Teams mention picker; unresolved \
+tokens are refused rather than sent as literal text.\n\
+- Existing composer drafts are preserved and block writes by default. Set clear_draft=true (or call \
+clear_chat_draft) only when the user explicitly wants the draft discarded.\n\
+- To answer a specific message use reply_to_chat_message with message_id from get_chat_messages. It sends a \
+quoted reply, verifying reply mode before sending and the quoted-reply card afterward.\n\
 - If a reply fails (REPLY_NOT_SENT) nothing was sent. Do NOT fall back to send_chat_message; ask the user. \
 allow_standalone_after_reply_failure=true is only for when the user explicitly asks for a new top-level message.\n\
 Errors are returned as tool results with isError=true; report them instead of retrying blindly.";
@@ -150,6 +156,9 @@ pub struct SendChatMessageRequest {
     /// Set true only when the user explicitly wants a new top-level message after a reply attempt failed.
     #[serde(default)]
     pub allow_standalone_after_reply_failure: bool,
+    /// Set true only when the user explicitly wants an existing composer draft cleared first.
+    #[serde(default)]
+    pub clear_draft: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -161,6 +170,18 @@ pub struct ReplyToChatMessageRequest {
     /// A single-line message to send as a reply.
     pub message: String,
     /// Required to perform the external send. Omit or set false for a preview.
+    #[serde(default)]
+    pub confirm: bool,
+    /// Set true only when the user explicitly wants an existing composer draft cleared first.
+    #[serde(default)]
+    pub clear_draft: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ClearChatDraftRequest {
+    /// Exact visible chat label.
+    pub chat_name: String,
+    /// Required to clear the visible Teams composer. Omit or set false for a preview.
     #[serde(default)]
     pub confirm: bool,
 }
@@ -286,6 +307,7 @@ impl TeamsServer {
             &request.message,
             request.confirm,
             request.allow_standalone_after_reply_failure,
+            request.clear_draft,
         )
         .await
         {
@@ -313,6 +335,7 @@ impl TeamsServer {
             &request.message_id,
             &request.message,
             request.confirm,
+            request.clear_draft,
         )
         .await
         {
@@ -320,6 +343,26 @@ impl TeamsServer {
             Err(error) => json_error(format!(
                 "REPLY_NOT_SENT: Could not reply to Teams chat message: {error:#}. Do not send the same text as a standalone message unless the user explicitly requests that change."
             )),
+        }
+    }
+
+    /// Clear the visible Teams composer draft without sending a message.
+    #[tool(
+        name = "clear_chat_draft",
+        description = "Clear (or preview, if confirm is false) the composer draft in an exact visible Teams chat. Never sends a message.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn clear_chat_draft(
+        &self,
+        Parameters(request): Parameters<ClearChatDraftRequest>,
+    ) -> CallToolResult {
+        match browser::clear_chat_draft(&request.chat_name, request.confirm).await {
+            Ok(value) => json_success(&value),
+            Err(error) => json_error(format!("Could not clear Teams chat draft: {error:#}")),
         }
     }
 
@@ -370,6 +413,8 @@ mod tests {
         let hidden = TeamsServer::with_debug_tools(false);
         assert!(!hidden.tool_router.has_route("inspect_teams_page"));
         assert!(hidden.tool_router.has_route("send_chat_message"));
+        assert!(hidden.tool_router.has_route("clear_chat_draft"));
+        assert_eq!(hidden.tool_router.list_all().len(), 9);
         let shown = TeamsServer::with_debug_tools(true);
         assert!(shown.tool_router.has_route("inspect_teams_page"));
     }
@@ -419,15 +464,15 @@ mod tests {
         let tools = TeamsServer::tool_router().list_all();
         assert_eq!(
             tools.len(),
-            9,
-            "expected 9 teams tools, got {}",
+            10,
+            "expected 10 teams tools, got {}",
             tools.len()
         );
         for tool in &tools {
             let read_only = tool.annotations.as_ref().and_then(|a| a.read_only_hint);
             if matches!(
                 tool.name.as_ref(),
-                "send_chat_message" | "reply_to_chat_message"
+                "send_chat_message" | "reply_to_chat_message" | "clear_chat_draft"
             ) {
                 assert_eq!(read_only, Some(false));
             } else {
@@ -438,6 +483,28 @@ mod tests {
                     tool.name
                 );
             }
+        }
+    }
+
+    #[test]
+    fn draft_management_is_exposed_for_teams_writes() {
+        let tools = TeamsServer::tool_router().list_all();
+        let tool_names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
+        assert!(tool_names.contains(&"clear_chat_draft"));
+
+        for name in ["send_chat_message", "reply_to_chat_message"] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name.as_ref() == name)
+                .expect("write tool must be registered");
+            let schema = serde_json::to_value(&tool.input_schema).expect("schema is serializable");
+            assert!(
+                schema
+                    .get("properties")
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(|properties| properties.contains_key("clear_draft")),
+                "{name} must expose clear_draft"
+            );
         }
     }
 }

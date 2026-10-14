@@ -16,7 +16,8 @@ use serde::Serialize;
 use tokio::time::{sleep, timeout};
 
 use crate::data::{
-    ItemsResult, MessagesResult, PageSnapshot, SendMessageResult, UiItem, VisibleMessage,
+    ClearDraftResult, ItemsResult, MessagesResult, PageSnapshot, SendMessageResult, UiItem,
+    VisibleMessage,
 };
 
 const DEFAULT_TEAMS_URL: &str = "https://teams.live.com/v2/";
@@ -252,6 +253,74 @@ fn validate_outgoing_message(message: &str) -> Result<()> {
         bail!("message must be a single line for the initial send implementation");
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MentionToken {
+    start: usize,
+    end: usize,
+    query: String,
+}
+
+fn mention_tokens(message: &str) -> Vec<MentionToken> {
+    let mut tokens = Vec::new();
+    for (start, character) in message.char_indices() {
+        if character != '@' {
+            continue;
+        }
+        let previous = message[..start].chars().next_back();
+        if previous.is_some_and(|value| value.is_alphanumeric() || "._-".contains(value)) {
+            continue;
+        }
+        let end = message[start + character.len_utf8()..]
+            .char_indices()
+            .find(|(_, value)| !value.is_alphanumeric() && !"._-".contains(*value))
+            .map(|(offset, _)| start + character.len_utf8() + offset)
+            .unwrap_or(message.len());
+        let query = &message[start + character.len_utf8()..end];
+        if query.chars().any(char::is_alphanumeric) {
+            tokens.push(MentionToken {
+                start,
+                end,
+                query: query.to_string(),
+            });
+        }
+    }
+    tokens
+}
+
+fn person_key(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter(|character| character.is_alphanumeric())
+        .collect()
+}
+
+fn resolve_mention_names(tokens: &[MentionToken], candidates: &[String]) -> Result<Vec<String>> {
+    let mut resolved = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        let wanted = person_key(&token.query);
+        let matches: Vec<&String> = candidates
+            .iter()
+            .filter(|candidate| {
+                let key = person_key(candidate);
+                key == wanted || (wanted.len() >= 3 && key.starts_with(&wanted))
+            })
+            .collect();
+        match matches.as_slice() {
+            [candidate] => resolved.push((*candidate).clone()),
+            [] => bail!(
+                "Could not resolve @{0} to a visible Teams participant; refusing to send a literal @text mention",
+                token.query
+            ),
+            _ => bail!(
+                "@{0} matches multiple visible Teams participants; use a more specific name",
+                token.query
+            ),
+        }
+    }
+    Ok(resolved)
 }
 
 fn looks_like_login_page(text: &str) -> bool {
@@ -766,46 +835,314 @@ pub async fn visible_messages(
 const COMPOSER_SELECTOR: &str = r#"[data-tid="ckeditor"][role="textbox"], [role="textbox"][aria-label="Type a message"], [contenteditable="true"][aria-label="Type a message"]"#;
 const SEND_SELECTOR: &str = r#"[data-tid="newMessageCommands-send"], button[aria-label^="Send"]"#;
 
+async fn composer_state(page: &chromiumoxide::Page) -> Result<(bool, String)> {
+    let state: serde_json::Value = page
+        .evaluate(format!(
+            r#"() => {{
+                const box = document.querySelector({composer:?});
+                return {{
+                    found: !!box,
+                    text: box?.innerText || box?.textContent || ''
+                }};
+            }}"#,
+            composer = COMPOSER_SELECTOR,
+        ))
+        .await?
+        .into_value()?;
+    Ok((
+        state
+            .get("found")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        state
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    ))
+}
+
+async fn clear_composer(page: &chromiumoxide::Page) -> Result<bool> {
+    let (found, text) = composer_state(page).await?;
+    if !found {
+        bail!("The current Teams UI did not expose the message composer");
+    }
+    if text.trim().is_empty() {
+        return Ok(false);
+    }
+
+    let composer = page
+        .find_element(COMPOSER_SELECTOR)
+        .await
+        .context("could not locate the Teams message composer")?;
+    composer.click().await?;
+    page.evaluate(format!(
+        r#"() => {{
+            const box = document.querySelector({composer:?});
+            if (!box) return false;
+            const selection = window.getSelection();
+            const range = document.createRange();
+            range.selectNodeContents(box);
+            selection?.removeAllRanges();
+            selection?.addRange(range);
+            return true;
+        }}"#,
+        composer = COMPOSER_SELECTOR,
+    ))
+    .await?
+    .into_value::<bool>()?;
+    composer.press_key("Backspace").await?;
+    sleep(Duration::from_millis(150)).await;
+
+    let (_, remaining) = composer_state(page).await?;
+    if !remaining.trim().is_empty() {
+        bail!("Teams did not clear the message composer draft");
+    }
+    Ok(true)
+}
+
+async fn chat_participant_names(page: &chromiumoxide::Page) -> Result<Vec<String>> {
+    let mut names = page
+        .evaluate(
+            r#"() => Array.from(document.querySelectorAll('[data-tid="message-author-name"]'))
+                .map(element => (element.innerText || element.textContent || '').replace(/\s+/g, ' ').trim())
+                .filter(Boolean)"#,
+        )
+        .await?
+        .into_value::<Vec<String>>()?;
+
+    let participant_button_clicked: bool = page
+        .evaluate(
+            r#"() => {
+                const button = document.querySelector('[data-tid="chat-header-participant-count"], [aria-label*="participant" i]');
+                if (!button) return false;
+                button.click();
+                return true;
+            }"#,
+        )
+        .await?
+        .into_value()?;
+    if participant_button_clicked {
+        sleep(Duration::from_millis(400)).await;
+        for item in evaluate_members(page).await? {
+            names.push(item.label);
+        }
+        // Leave the composer unobstructed and ensure the mention picker is the
+        // only participant-like popup open when a token is typed.
+        page.evaluate(
+            r#"() => {
+                const button = document.querySelector('[data-tid="chat-header-participant-count"], [aria-label*="participant" i]');
+                button?.click();
+            }"#,
+        )
+        .await?;
+        sleep(Duration::from_millis(150)).await;
+    }
+
+    let mut unique = Vec::new();
+    for name in names {
+        if !name.is_empty() && !unique.iter().any(|item| item == &name) {
+            unique.push(name);
+        }
+    }
+    Ok(unique)
+}
+
+async fn click_mention_suggestion(page: &chromiumoxide::Page, display_name: &str) -> Result<bool> {
+    let wanted = serde_json::to_string(&person_key(display_name))?;
+    page.evaluate(format!(
+        r#"() => {{
+            const wanted = {wanted};
+            const normalize = value => (value || '').replace(/\s+/g, ' ').trim();
+            const key = value => Array.from(normalize(value).toLowerCase())
+                .filter(character => /[a-z0-9\u00c0-\u024f]/i.test(character)).join('');
+            const visible = element => {{
+                const rect = element.getBoundingClientRect();
+                const style = getComputedStyle(element);
+                return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+            }};
+            const label = element => normalize(element.getAttribute('aria-label') || element.innerText || element.textContent);
+            const candidates = Array.from(document.querySelectorAll(
+                '[role="option"], [role="menuitem"], [data-tid*="mention" i], [data-tid*="suggest" i], [data-tid*="person" i]'
+            )).filter(visible);
+            const exact = candidates.find(element => key(label(element)) === wanted);
+            const partial = candidates.find(element => key(label(element)).startsWith(wanted));
+            const target = exact || partial;
+            if (!target) return false;
+            target.click();
+            return true;
+        }}"#,
+        wanted = wanted,
+    ))
+    .await?
+    .into_value()
+    .map_err(Into::into)
+}
+
+async fn type_message_with_mentions(
+    page: &chromiumoxide::Page,
+    message: &str,
+    tokens: &[MentionToken],
+    resolved_mentions: &[String],
+) -> Result<String> {
+    let mut cursor = 0;
+    let mut expected = String::new();
+    for (token, display_name) in tokens.iter().zip(resolved_mentions) {
+        let plain = &message[cursor..token.start];
+        if !plain.is_empty() {
+            page.execute(InsertTextParams::new(plain.to_string()))
+                .await?;
+            expected.push_str(plain);
+        }
+
+        let first_word = display_name
+            .split_whitespace()
+            .next()
+            .unwrap_or(display_name);
+        page.execute(InsertTextParams::new(format!("@{first_word}")))
+            .await?;
+        sleep(Duration::from_millis(350)).await;
+        if !click_mention_suggestion(page, display_name).await? {
+            bail!(
+                "Teams did not expose a mention suggestion for {display_name:?}; refusing to send a literal @text mention"
+            );
+        }
+        expected.push_str(display_name);
+        cursor = token.end;
+    }
+    let suffix = &message[cursor..];
+    if !suffix.is_empty() {
+        page.execute(InsertTextParams::new(suffix.to_string()))
+            .await?;
+    }
+    expected.push_str(suffix);
+    Ok(expected)
+}
+
+async fn composer_has_reply_context(
+    page: &chromiumoxide::Page,
+    message_id: &str,
+    target_text: &str,
+) -> Result<bool> {
+    let message_id = serde_json::to_string(message_id)?;
+    let target_text = serde_json::to_string(&target_text.replace('\n', " "))?;
+    page.evaluate(format!(
+        r#"() => {{
+            const wantedId = {message_id};
+            const wantedText = {target_text}.replace(/\s+/g, ' ').trim().toLowerCase();
+            const composer = document.querySelector({composer:?});
+            if (!composer) return false;
+            const composeFooter = composer.closest('[data-tid="chat-pane-compose-message-footer"]');
+            const visible = element => {{
+                const rect = element.getBoundingClientRect();
+                const style = getComputedStyle(element);
+                return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+            }};
+            const inMessageList = element => element.closest('[data-tid="chat-pane-item"], [data-tid="message-pane-list-runway"]');
+            const contexts = Array.from(document.querySelectorAll(
+                '[data-tid="quoted-reply-card"], [data-tid*="quoted-reply" i], [data-tid*="reply" i], [data-tid*="quote" i], [aria-label*="reply" i], [aria-label*="quote" i]'
+            )).filter(element => visible(element) && !inMessageList(element));
+            const matchesTarget = element => {{
+                const attributes = [element.id, element.getAttribute('data-message-id'), element.getAttribute('data-id'), element.getAttribute('aria-label')].filter(Boolean);
+                const text = (element.innerText || element.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                return attributes.includes(wantedId) || (wantedText && text.includes(wantedText));
+            }};
+            if (contexts.some(matchesTarget)) return true;
+            // Some Teams builds render the reply card in a portal without the
+            // target message text; the compose footer is still an unambiguous scope.
+            return !!composeFooter && contexts.some(element => composeFooter.contains(element));
+        }}"#,
+        composer = COMPOSER_SELECTOR,
+        message_id = message_id,
+        target_text = target_text,
+    ))
+    .await?
+    .into_value()
+    .map_err(Into::into)
+}
+
+async fn wait_for_reply_context(
+    page: &chromiumoxide::Page,
+    message_id: &str,
+    target_text: &str,
+) -> Result<bool> {
+    for _ in 0..10 {
+        if composer_has_reply_context(page, message_id, target_text).await? {
+            return Ok(true);
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+    Ok(false)
+}
+
+async fn verify_sent_reply(
+    page: &chromiumoxide::Page,
+    message_id: &str,
+    target_text: &str,
+    outgoing_message: &str,
+) -> Result<bool> {
+    let message_id = serde_json::to_string(message_id)?;
+    let target_text = serde_json::to_string(&target_text.replace('\n', " "))?;
+    let outgoing_message = serde_json::to_string(outgoing_message)?;
+    for _ in 0..10 {
+        let verified: bool = page
+            .evaluate(format!(
+                r#"() => {{
+                    const wantedId = {message_id};
+                    const wantedText = {target_text}.replace(/\s+/g, ' ').trim().toLowerCase();
+                    const outgoing = {outgoing_message}.replace(/\s+/g, ' ').trim().toLowerCase();
+                    return Array.from(document.querySelectorAll('[data-tid="chat-pane-item"]')).some(item => {{
+                        const card = item.querySelector('[data-tid="quoted-reply-card"], [data-tid*="quoted-reply" i], [data-tid*="reply-card" i]');
+                        const body = item.querySelector('[data-tid="chat-pane-message"]');
+                        if (!card || !body) return false;
+                        const cardText = (card.innerText || card.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                        const bodyText = (body.innerText || body.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                        const attributes = [card.id, card.getAttribute('data-message-id'), card.getAttribute('data-id')].filter(Boolean);
+                        return (attributes.includes(wantedId) || (wantedText && cardText.includes(wantedText))) && bodyText.includes(outgoing);
+                    }});
+                }}"#,
+                message_id = message_id,
+                target_text = target_text,
+                outgoing_message = outgoing_message,
+            ))
+            .await?
+            .into_value()?;
+        if verified {
+            return Ok(true);
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+    Ok(false)
+}
+
 async fn send_from_composer(
     page: &chromiumoxide::Page,
     chat_name: &str,
     message: &str,
     reply_to_message_id: Option<String>,
     reply_context_allowed: bool,
+    reply_target: Option<(&str, &str)>,
+    clear_draft: bool,
 ) -> Result<SendMessageResult> {
-    let before: serde_json::Value = page
-        .evaluate(format!(
-            r#"() => {{
-                const box = document.querySelector({composer:?});
-                const send = document.querySelector({send:?});
-                return {{
-                    found: !!box,
-                    text: box?.innerText || box?.textContent || '',
-                    disabled: !send || send.disabled || send.getAttribute('aria-disabled') === 'true'
-                }};
-            }}"#,
-            composer = COMPOSER_SELECTOR,
-            send = SEND_SELECTOR,
-        ))
-        .await?
-        .into_value()?;
-    if !before
-        .get("found")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
+    let (found, initial_text) = composer_state(page).await?;
+    if !found {
         bail!("The current Teams UI did not expose the message composer");
     }
-    if !reply_context_allowed
-        && !before
-            .get("text")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .trim()
-            .is_empty()
-    {
-        bail!("The message composer already contains a draft; refusing to overwrite it");
+    if !initial_text.trim().is_empty() {
+        if !clear_draft {
+            bail!("The message composer already contains a draft; refusing to overwrite it");
+        }
+        clear_composer(page).await?;
     }
+    let cleanup_on_error = clear_draft || initial_text.trim().is_empty();
+
+    let tokens = mention_tokens(message);
+    let resolved_mentions = if tokens.is_empty() {
+        Vec::new()
+    } else {
+        let candidates = chat_participant_names(page).await?;
+        resolve_mention_names(&tokens, &candidates)?
+    };
 
     let composer = page
         .find_element(COMPOSER_SELECTOR)
@@ -815,12 +1152,21 @@ async fn send_from_composer(
 
     // type_str() calls press_key() for every character and fails for characters
     // that are not entries in chromiumoxide's keyboard-key table. Input.insertText
-    // is the CDP operation intended for IME, emoji, and other Unicode text.
-    page.execute(InsertTextParams::new(message.to_string()))
-        .await?;
+    // is the CDP operation intended for IME, emoji, and other Unicode text. Mention
+    // tokens are typed through Teams' picker so they become real mention entities.
+    let expected_text =
+        match type_message_with_mentions(page, message, &tokens, &resolved_mentions).await {
+            Ok(text) => text,
+            Err(error) => {
+                if cleanup_on_error {
+                    let _ = clear_composer(page).await;
+                }
+                return Err(error);
+            }
+        };
     sleep(Duration::from_millis(150)).await;
 
-    let typed: serde_json::Value = page
+    let typed: serde_json::Value = match page
         .evaluate(format!(
             r#"() => {{
                 const box = document.querySelector({composer:?});
@@ -833,15 +1179,34 @@ async fn send_from_composer(
             composer = COMPOSER_SELECTOR,
             send = SEND_SELECTOR,
         ))
-        .await?
-        .into_value()?;
+        .await
+    {
+        Ok(value) => match value.into_value() {
+            Ok(value) => value,
+            Err(error) => {
+                if cleanup_on_error {
+                    let _ = clear_composer(page).await;
+                }
+                return Err(error.into());
+            }
+        },
+        Err(error) => {
+            if cleanup_on_error {
+                let _ = clear_composer(page).await;
+            }
+            return Err(error.into());
+        }
+    };
     let typed_text = typed
         .get("text")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
-    let typed_text_matches = typed_text.trim() == message.trim()
-        || (reply_context_allowed && typed_text.trim_end().ends_with(message.trim()));
+    let typed_text_matches = typed_text.trim() == expected_text.trim()
+        || (reply_context_allowed && typed_text.trim_end().ends_with(expected_text.trim()));
     if !typed_text_matches {
+        if cleanup_on_error {
+            let _ = clear_composer(page).await;
+        }
         bail!("Teams did not expose the typed message exactly; refusing to click Send");
     }
     if typed
@@ -849,14 +1214,31 @@ async fn send_from_composer(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(true)
     {
+        if cleanup_on_error {
+            let _ = clear_composer(page).await;
+        }
         bail!("The Teams Send control is unavailable or disabled");
     }
 
-    let send_button = page
+    let send_button = match page
         .find_element(SEND_SELECTOR)
         .await
-        .context("could not locate the Teams Send control")?;
-    send_button.click().await?;
+        .context("could not locate the Teams Send control")
+    {
+        Ok(button) => button,
+        Err(error) => {
+            if cleanup_on_error {
+                let _ = clear_composer(page).await;
+            }
+            return Err(error);
+        }
+    };
+    if let Err(error) = send_button.click().await {
+        if cleanup_on_error {
+            let _ = clear_composer(page).await;
+        }
+        return Err(error.into());
+    }
     sleep(Duration::from_millis(700)).await;
 
     let remaining: String = page
@@ -873,6 +1255,17 @@ async fn send_from_composer(
                 .to_string(),
         );
     }
+    let reply_context_verified = if let Some((message_id, target_text)) = reply_target {
+        let verified = verify_sent_reply(page, message_id, target_text, typed_text).await?;
+        if !verified {
+            warnings.push(
+                "Teams sent the message, but the target quoted-reply card could not be verified; inspect the chat before retrying.".to_string(),
+            );
+        }
+        Some(verified)
+    } else {
+        None
+    };
     Ok(SendMessageResult {
         chat_name: chat_name.to_string(),
         message: message.to_string(),
@@ -880,44 +1273,33 @@ async fn send_from_composer(
         sent: true,
         confirmation_required: false,
         page_url: page.url().await?.unwrap_or_default(),
+        resolved_mentions,
+        reply_context_verified,
         warnings,
     })
 }
 
 async fn ensure_composer_empty(page: &chromiumoxide::Page) -> Result<()> {
-    let state: serde_json::Value = page
-        .evaluate(format!(
-            r#"() => {{
-                const box = document.querySelector({composer:?});
-                return {{
-                    found: !!box,
-                    text: box?.innerText || box?.textContent || ''
-                }};
-            }}"#,
-            composer = COMPOSER_SELECTOR,
-        ))
-        .await?
-        .into_value()?;
-    if !state
-        .get("found")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
+    let (found, text) = composer_state(page).await?;
+    if !found {
         bail!("The current Teams UI did not expose the message composer");
     }
-    if !state
-        .get("text")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .trim()
-        .is_empty()
-    {
+    if !text.trim().is_empty() {
         bail!("The message composer already contains a draft; refusing to overwrite it");
     }
     Ok(())
 }
 
-async fn message_center(page: &chromiumoxide::Page, message_id: &str) -> Result<Option<Point>> {
+#[derive(Debug, Clone)]
+struct MessageTarget {
+    point: Point,
+    text: String,
+}
+
+async fn message_center(
+    page: &chromiumoxide::Page,
+    message_id: &str,
+) -> Result<Option<MessageTarget>> {
     let message_id = serde_json::to_string(message_id)?;
     let point: serde_json::Value = page
         .evaluate(format!(
@@ -934,7 +1316,11 @@ async fn message_center(page: &chromiumoxide::Page, message_id: &str) -> Result<
                 const container = message.closest('[data-tid="chat-pane-item"]') || message.closest('[data-tid="chat-pane-message"]') || message;
                 container.scrollIntoView({{ block: 'center', inline: 'nearest' }});
                 const rect = container.getBoundingClientRect();
-                return {{ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }};
+                return {{
+                    x: rect.left + rect.width / 2,
+                    y: rect.top + rect.height / 2,
+                    text: message.getAttribute('aria-label') || message.innerText || message.textContent || ''
+                }};
             }}"#,
             message_id = message_id,
         ))
@@ -946,17 +1332,31 @@ async fn message_center(page: &chromiumoxide::Page, message_id: &str) -> Result<
     let Some(y) = point.get("y").and_then(serde_json::Value::as_f64) else {
         return Ok(None);
     };
-    Ok(Some(Point::new(x, y)))
+    let text = point
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .replace('\n', " ")
+        .trim()
+        .to_string();
+    Ok(Some(MessageTarget {
+        point: Point::new(x, y),
+        text,
+    }))
 }
 
 async fn click_reply_action(page: &chromiumoxide::Page, message_id: &str) -> Result<bool> {
-    let Some(point) = message_center(page, message_id).await? else {
+    let Some(target) = message_center(page, message_id).await? else {
         return Ok(false);
     };
-    page.move_mouse(point).await?;
+    page.move_mouse(target.point).await?;
     sleep(Duration::from_millis(350)).await;
 
     let message_id = serde_json::to_string(message_id)?;
+    page.evaluate(
+        r#"() => document.querySelectorAll('[data-mcp-reply-action]').forEach(element => element.removeAttribute('data-mcp-reply-action'))"#,
+    )
+    .await?;
     let action: String = page
         .evaluate(format!(
             r#"() => {{
@@ -981,12 +1381,12 @@ async fn click_reply_action(page: &chromiumoxide::Page, message_id: &str) -> Res
                     element.getAttribute('data-tid'),
                     element.matches('button, [role="button"], [role="menuitem"]') ? element.innerText : ''
                 ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
-                const controls = root => Array.from(root.querySelectorAll('button, [role="button"], [role="menuitem"], [aria-label], [title], [data-tid]'))
+                const controls = root => Array.from(root.querySelectorAll('button, [role="button"], [role="menuitem"], [data-tid*="action" i], [data-tid*="reply" i]'))
                     .filter(visible);
                 const reply = controls(container).find(element => /\breply\b/i.test(label(element)));
-                if (reply) {{ reply.click(); return 'reply'; }}
+                if (reply) {{ reply.setAttribute('data-mcp-reply-action', 'reply'); return 'reply'; }}
                 const more = controls(container).find(element => /\b(more|options|actions)\b/i.test(label(element)));
-                if (more) {{ more.click(); return 'more'; }}
+                if (more) {{ more.setAttribute('data-mcp-reply-action', 'more'); return 'more'; }}
                 return 'none';
             }}"#,
             message_id = message_id,
@@ -994,11 +1394,24 @@ async fn click_reply_action(page: &chromiumoxide::Page, message_id: &str) -> Res
         .await?
         .into_value()?;
     if action == "reply" {
+        page.find_element(r#"[data-mcp-reply-action="reply"]"#)
+            .await?
+            .click()
+            .await?;
+        page.evaluate(
+            r#"() => document.querySelectorAll('[data-mcp-reply-action]').forEach(element => element.removeAttribute('data-mcp-reply-action'))"#,
+        )
+        .await?;
         return Ok(true);
     }
     if action != "more" {
         return Ok(false);
     }
+
+    page.find_element(r#"[data-mcp-reply-action="more"]"#)
+        .await?
+        .click()
+        .await?;
 
     sleep(Duration::from_millis(250)).await;
     let clicked: bool = page
@@ -1012,19 +1425,31 @@ async fn click_reply_action(page: &chromiumoxide::Page, message_id: &str) -> Res
                 const label = element => [
                     element.getAttribute('aria-label'),
                     element.getAttribute('title'),
+                    element.getAttribute('data-tid'),
                     element.matches('button, [role="button"], [role="menuitem"]') ? element.innerText : ''
                 ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
-                const reply = Array.from(document.querySelectorAll('[role="menuitem"], button, [role="button"], [aria-label], [title]'))
+                const reply = Array.from(document.querySelectorAll('[role="menuitem"], button, [role="button"], [data-tid*="action" i], [data-tid*="reply" i]'))
                     .filter(visible)
                     .find(element => /^reply(?: to message)?$/i.test(label(element)) || /\breply\b/i.test(label(element)));
                 if (!reply) return false;
-                reply.click();
+                reply.setAttribute('data-mcp-reply-action', 'menu-reply');
                 return true;
             }"#,
         )
         .await?
         .into_value()?;
-    Ok(clicked)
+    if !clicked {
+        return Ok(false);
+    }
+    page.find_element(r#"[data-mcp-reply-action="menu-reply"]"#)
+        .await?
+        .click()
+        .await?;
+    page.evaluate(
+        r#"() => document.querySelectorAll('[data-mcp-reply-action]').forEach(element => element.removeAttribute('data-mcp-reply-action'))"#,
+    )
+    .await?;
+    Ok(true)
 }
 
 pub async fn send_chat_message(
@@ -1032,6 +1457,7 @@ pub async fn send_chat_message(
     message: &str,
     confirm: bool,
     allow_after_reply_failure: bool,
+    clear_draft: bool,
 ) -> Result<SendMessageResult> {
     let chat_name = chat_name.trim();
     if chat_name.is_empty() {
@@ -1047,6 +1473,8 @@ pub async fn send_chat_message(
             sent: false,
             confirmation_required: true,
             page_url: teams_url(),
+            resolved_mentions: Vec::new(),
+            reply_context_verified: None,
             warnings: vec![
                 "Preview only: pass confirm=true to open the chat and send this message."
                     .to_string(),
@@ -1070,7 +1498,16 @@ pub async fn send_chat_message(
         }
         sleep(Duration::from_millis(600)).await;
 
-        send_from_composer(&session.page, chat_name, message, None, false).await
+        send_from_composer(
+            &session.page,
+            chat_name,
+            message,
+            None,
+            false,
+            None,
+            clear_draft,
+        )
+        .await
     }
     .await;
     finish(session).await?;
@@ -1085,6 +1522,7 @@ pub async fn reply_to_chat_message(
     message_id: &str,
     message: &str,
     confirm: bool,
+    clear_draft: bool,
 ) -> Result<SendMessageResult> {
     let chat_name = chat_name.trim();
     let message_id = message_id.trim();
@@ -1104,6 +1542,8 @@ pub async fn reply_to_chat_message(
             sent: false,
             confirmation_required: true,
             page_url: teams_url(),
+            resolved_mentions: Vec::new(),
+            reply_context_verified: None,
             warnings: vec![
                 "Preview only: pass confirm=true to open the chat and send this reply.".to_string(),
             ],
@@ -1122,17 +1562,29 @@ pub async fn reply_to_chat_message(
             bail!("Could not find an exact visible chat label {chat_name:?}; refusing to reply");
         }
         sleep(Duration::from_millis(600)).await;
-        ensure_composer_empty(&session.page).await?;
+        if clear_draft {
+            clear_composer(&session.page).await?;
+        } else {
+            ensure_composer_empty(&session.page).await?;
+        }
+        let Some(target) = message_center(&session.page, message_id).await? else {
+            bail!("Could not find visible Teams message {message_id:?}; refusing to reply");
+        };
         if !click_reply_action(&session.page, message_id).await? {
             bail!("Could not find a Reply action for visible Teams message {message_id:?}; refusing to send");
         }
         sleep(Duration::from_millis(300)).await;
+        if !wait_for_reply_context(&session.page, message_id, &target.text).await? {
+            bail!("Teams did not enter reply mode for visible Teams message {message_id:?}; refusing to send a top-level message");
+        }
         send_from_composer(
             &session.page,
             chat_name,
             message,
             Some(message_id.to_string()),
             true,
+            Some((message_id, &target.text)),
+            clear_draft,
         )
         .await
     }
@@ -1143,6 +1595,51 @@ pub async fn reply_to_chat_message(
     } else {
         clear_failed_reply();
     }
+    result
+}
+
+pub async fn clear_chat_draft(chat_name: &str, confirm: bool) -> Result<ClearDraftResult> {
+    let chat_name = chat_name.trim();
+    if chat_name.is_empty() {
+        bail!("chat_name is required");
+    }
+    if !confirm {
+        return Ok(ClearDraftResult {
+            chat_name: chat_name.to_string(),
+            cleared: false,
+            confirmation_required: true,
+            page_url: teams_url(),
+            warnings: vec![
+                "Preview only: pass confirm=true to clear the Teams composer draft.".to_string(),
+            ],
+        });
+    }
+
+    let session = prepared_page().await?;
+    let result = async {
+        let navigation_clicked = click_navigation(&session.page, &["Chat", "Chats"]).await?;
+        if navigation_clicked {
+            sleep(Duration::from_millis(400)).await;
+        } else {
+            bail!("Could not find the Chat navigation control");
+        }
+        if !click_visible_label(&session.page, chat_name).await? {
+            bail!(
+                "Could not find an exact visible chat label {chat_name:?}; refusing to clear draft"
+            );
+        }
+        sleep(Duration::from_millis(600)).await;
+        let cleared = clear_composer(&session.page).await?;
+        Ok(ClearDraftResult {
+            chat_name: chat_name.to_string(),
+            cleared,
+            confirmation_required: false,
+            page_url: session.page.url().await?.unwrap_or_default(),
+            warnings: Vec::new(),
+        })
+    }
+    .await;
+    finish(session).await?;
     result
 }
 
@@ -1272,7 +1769,7 @@ pub fn logout() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_outgoing_message;
+    use super::{MentionToken, mention_tokens, resolve_mention_names, validate_outgoing_message};
 
     #[test]
     fn outgoing_messages_accept_unicode_text() {
@@ -1282,5 +1779,34 @@ mod tests {
     #[test]
     fn outgoing_messages_still_reject_multiline_text() {
         assert!(validate_outgoing_message("first line\nsecond line").is_err());
+    }
+
+    #[test]
+    fn mention_tokens_find_handles_without_matching_email_addresses() {
+        assert_eq!(
+            mention_tokens("Hi @herman_lindalen_nodeland and mail me@example.com"),
+            vec![MentionToken {
+                start: 3,
+                end: 28,
+                query: "herman_lindalen_nodeland".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn mention_handles_resolve_to_visible_display_names() {
+        let tokens = mention_tokens("@herman_lindalen_nodeland");
+        let names = vec!["Herman Lindalen Nodeland".to_string()];
+        assert_eq!(
+            resolve_mention_names(&tokens, &names).unwrap(),
+            vec!["Herman Lindalen Nodeland"]
+        );
+    }
+
+    #[test]
+    fn unresolved_mentions_are_rejected() {
+        let tokens = mention_tokens("@nobody");
+        let names = vec!["Herman Lindalen Nodeland".to_string()];
+        assert!(resolve_mention_names(&tokens, &names).is_err());
     }
 }

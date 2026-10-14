@@ -28,9 +28,13 @@ HTTP has no built-in authentication and should remain bound to loopback unless a
 - `list_chats` — visible chat labels.
 - `list_chat_members` — visible users/participants for an exact visible chat label.
 - `get_chat_messages` — paginated visible messages for an exact visible chat label. Page 1 is newest; higher pages scroll toward older messages. The default is 10 messages per page.
-- `send_chat_message` — preview or confirmation-gated send of a single-line Unicode message to an exact visible chat. It never sends unless `confirm: true` is passed.
-- `reply_to_chat_message` — preview or confirmation-gated Unicode reply to a visible message, using its `message_id` from `get_chat_messages`.
-- `inspect_teams_page` — bounded adapter diagnostics.
+- `inspect_teams_page` — bounded adapter diagnostics. Hidden unless `TEAMS_MCP_DEBUG_TOOLS=1` is set.
+
+## Write tools
+
+- `send_chat_message` — preview or confirmation-gated send of a single-line Unicode message to an exact visible chat. `@person` tokens are resolved through the visible Teams participant list and mention picker; unresolved tokens are refused instead of being sent as literal text. It never sends unless `confirm: true` is passed. Set `clear_draft: true` only when the user explicitly wants an existing composer draft cleared first.
+- `reply_to_chat_message` — preview or confirmation-gated Unicode quoted reply to a visible message, using its `message_id` from `get_chat_messages`. It verifies reply mode before sending and verifies the target quoted-reply card afterward. Set `clear_draft: true` to explicitly clear an existing composer draft before replying.
+- `clear_chat_draft` — preview or confirmation-gated clearing of the visible composer draft without sending a message.
 
 The first version intentionally uses the visible Teams UI rather than undocumented network calls or Microsoft Graph credentials. Team, channel, and chat names are UI references, not invented backend IDs. Message results include visible text plus author, author ID, timestamp, message ID, and edited metadata when the page exposes them. Teams is a large SPA and its DOM can change; `inspect_teams_page` and the warnings in results make that behavior observable.
 
@@ -58,4 +62,4 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo build
 ```
 
-Sending and replying are the only write operations currently supported. The tools refuse empty, multiline, overlong, ambiguous, or already-drafted messages and use the visible Teams composer and Send control. A failed reply cannot silently fall back to a top-level send; `allow_standalone_after_reply_failure` must be set only when the user explicitly changes the request. Unicode text, including accented letters and emoji, is inserted through Chrome's text-input path rather than simulated key names. File downloads, edits/deletes, and Microsoft Graph integration are deliberately not included.
+Sending, replying, and clearing drafts are the only write operations currently supported. Drafts are preserved by default; clearing is explicit, and text inserted by a failed MCP send is cleaned up before the error is returned. The tools refuse empty, multiline, overlong, and ambiguous messages and use the visible Teams composer and Send control. A failed reply cannot silently fall back to a top-level send; `allow_standalone_after_reply_failure` must be set only when the user explicitly changes the request. Unicode text, including accented letters and emoji, is inserted through Chrome's text-input path rather than simulated key names. File downloads, edits/deletes, and Microsoft Graph integration are deliberately not included.

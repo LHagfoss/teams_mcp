@@ -69,5 +69,19 @@ pub struct SendMessageResult {
     pub confirmation_required: bool,
     pub page_url: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolved_mentions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_context_verified: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ClearDraftResult {
+    pub chat_name: String,
+    pub cleared: bool,
+    pub confirmation_required: bool,
+    pub page_url: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
 }
